@@ -36,6 +36,9 @@ struct edid_map edid_table[] = {
 #define CVT_RB_MIN_VBLANK_US 460
 #define CVT_RB_H_SYNC 32
 #define CVT_RB_H_BLANK 160
+#define CVT_COMPACT_H_BLANK 80
+#define CVT_COMPACT_H_FRONT_PORCH 8
+#define HDMI_MAX_TMDS_CLOCK_KHZ 600000
 #define CVT_RB_V_FRONT_PORCH 3
 #define CVT_MIN_V_BACK_PORCH 6
 
@@ -65,6 +68,7 @@ struct cea_mode {
     unsigned int vsync;
     unsigned int vback;
     unsigned int vic;
+    unsigned char dtd_flags;
 };
 
 static void print_usage(const char *program_name)
@@ -87,7 +91,7 @@ static void print_usage(const char *program_name)
     printf("  %s -d /dev/video1 -r 1280x720@50 # 设置到指定设备\n", name);
     printf("  %s -s 1920x1080_no_nv24         # 使用已有 EDID\n", name);
     printf("  %s -f edid.txt                   # 从文件加载 EDID\n", name);
-    printf("\n标准 4K 模式自动使用 CTA-861 时序和 256 字节 HDMI 2.0 扩展块。\n");
+    printf("\n标准 HDMI 模式自动使用 CTA-861 时序和对应 VIC。\n");
 
     printf("\n当前内置分辨率:\n");
     for (size_t i = 0; i < sizeof(edid_table) / sizeof(edid_table[0]); ++i)
@@ -126,8 +130,8 @@ static int parse_video_mode(const char *text, unsigned int *width,
         return -1;
     }
 
-    if (parsed_width < 320 || parsed_width > 4095 ||
-        parsed_height < 200 || parsed_height > 4095 ||
+    if (parsed_width < 320 || parsed_width > 4096 ||
+        parsed_height < 200 || parsed_height > 2160 ||
         parsed_frame_rate < 1 || parsed_frame_rate > 240)
         return -1;
 
@@ -198,12 +202,28 @@ static int generate_cvt_rb_timing(unsigned int requested_width,
     timing->cea_vic = 0;
     timing->dtd_flags = 0x1a; /* Positive HSync, negative VSync. */
 
-    if (timing->htotal > 4095 || timing->vtotal > 4095)
-        return -1;
-
     pixel_clock_khz = (uint64_t)timing->htotal * 1000000ULL / hperiod_ns;
     pixel_clock_khz -= pixel_clock_khz % CVT_CLOCK_STEP_KHZ;
-    if (!pixel_clock_khz || pixel_clock_khz > 655350)
+    if (pixel_clock_khz > HDMI_MAX_TMDS_CLOCK_KHZ) {
+        uint64_t compact_clock_khz;
+
+        /* A shorter horizontal blank can keep high-refresh custom modes
+         * inside the 600 MHz HDMI link budget. QHD@144 was verified on the
+         * RK3588 receiver with 8/32/40-pixel front/sync/back porches.
+         */
+        compact_clock_khz =
+            (uint64_t)(width + CVT_COMPACT_H_BLANK) * 1000000ULL /
+            hperiod_ns;
+        compact_clock_khz -= compact_clock_khz % CVT_CLOCK_STEP_KHZ;
+        if (compact_clock_khz <= HDMI_MAX_TMDS_CLOCK_KHZ) {
+            timing->hsync_start = width + CVT_COMPACT_H_FRONT_PORCH;
+            timing->hsync_end = timing->hsync_start + CVT_RB_H_SYNC;
+            timing->htotal = width + CVT_COMPACT_H_BLANK;
+            pixel_clock_khz = compact_clock_khz;
+        }
+    }
+    if (!pixel_clock_khz || pixel_clock_khz > HDMI_MAX_TMDS_CLOCK_KHZ ||
+        timing->htotal > 4095 || timing->vtotal > 4095)
         return -1;
 
     timing->pixel_clock_khz = (unsigned int)pixel_clock_khz;
@@ -215,11 +235,24 @@ static int generate_cea_timing(unsigned int width, unsigned int height,
                                struct video_timing *timing)
 {
     static const struct cea_mode modes[] = {
-        {3840, 2160, 24, 297000, 1276, 88, 296, 8, 10, 72, 93},
-        {3840, 2160, 25, 297000, 1056, 88, 296, 8, 10, 72, 94},
-        {3840, 2160, 30, 297000,  176, 88, 296, 8, 10, 72, 95},
-        {3840, 2160, 50, 594000, 1056, 88, 296, 8, 10, 72, 96},
-        {3840, 2160, 60, 594000,  176, 88, 296, 8, 10, 72, 97},
+        { 640,  480, 60,  25175,   16, 96,  48, 10,  2, 33,   1, 0x18},
+        {1280,  720, 50,  74250,  440, 40, 220,  5,  5, 20,  19, 0x1e},
+        {1280,  720, 60,  74250,  110, 40, 220,  5,  5, 20,   4, 0x1e},
+        {1920, 1080, 24,  74250,  638, 44, 148,  4,  5, 36,  32, 0x1e},
+        {1920, 1080, 25,  74250,  528, 44, 148,  4,  5, 36,  33, 0x1e},
+        {1920, 1080, 30,  74250,   88, 44, 148,  4,  5, 36,  34, 0x1e},
+        {1920, 1080, 50, 148500,  528, 44, 148,  4,  5, 36,  31, 0x1e},
+        {1920, 1080, 60, 148500,   88, 44, 148,  4,  5, 36,  16, 0x1e},
+        {3840, 2160, 24, 297000, 1276, 88, 296,  8, 10, 72,  93, 0x1e},
+        {3840, 2160, 25, 297000, 1056, 88, 296,  8, 10, 72,  94, 0x1e},
+        {3840, 2160, 30, 297000,  176, 88, 296,  8, 10, 72,  95, 0x1e},
+        {3840, 2160, 50, 594000, 1056, 88, 296,  8, 10, 72,  96, 0x1e},
+        {3840, 2160, 60, 594000,  176, 88, 296,  8, 10, 72,  97, 0x1e},
+        {4096, 2160, 24, 297000, 1020, 88, 296,  8, 10, 72,  98, 0x1e},
+        {4096, 2160, 25, 297000,  968, 88, 128,  8, 10, 72,  99, 0x1e},
+        {4096, 2160, 30, 297000,   88, 88, 128,  8, 10, 72, 100, 0x1e},
+        {4096, 2160, 50, 594000,  968, 88, 128,  8, 10, 72, 101, 0x1e},
+        {4096, 2160, 60, 594000,   88, 88, 128,  8, 10, 72, 102, 0x1e},
     };
 
     if (!timing)
@@ -242,7 +275,7 @@ static int generate_cea_timing(unsigned int width, unsigned int height,
         timing->vtotal = timing->vsync_end + mode->vback;
         timing->pixel_clock_khz = mode->pixel_clock_khz;
         timing->cea_vic = mode->vic;
-        timing->dtd_flags = 0x1e; /* Positive HSync, positive VSync. */
+        timing->dtd_flags = mode->dtd_flags;
         return 0;
     }
 
@@ -327,54 +360,109 @@ static unsigned char calculate_block_checksum(const unsigned char *block)
     return (unsigned char)(0x100 - (sum & 0xff));
 }
 
-static int generate_native_compatible_4k_edid(
-    unsigned int native_vic, unsigned char edid[MAX_EDID_SIZE])
+static int generate_native_compatible_uhd_edid(
+    unsigned int native_vic, const struct video_timing *timing,
+    unsigned char edid[MAX_EDID_SIZE])
 {
+    static const unsigned char audio_block[] = {
+        0x23, 0x09, 0x07, 0x07
+    };
+    static const unsigned char speaker_block[] = {
+        0x83, 0x01, 0x00, 0x00
+    };
+    static const unsigned char hdmi_vsdb[] = {
+        0x67, 0x03, 0x0c, 0x00, 0x30, 0x00, 0x00, 0x44
+    };
+    static const unsigned char hdmi_vsdb_dci24[] = {
+        0x6b, 0x03, 0x0c, 0x00, 0x30, 0x00, 0x00, 0x44,
+        0x20, 0x00, 0x20, 0x04 /* HDMI VIC 4: 4096x2160@24 */
+    };
+    static const unsigned char colorimetry_block[] = {
+        0xe3, 0x05, 0x03, 0x01
+    };
     unsigned char *extension;
-    size_t position;
-    int found_native_vic = 0;
+    struct video_timing base_dtd;
+    size_t position = 4;
 
-    if (!edid || native_vic < 93 || native_vic > 97 ||
+    if (!edid || !timing || native_vic < 93 || native_vic > 102 ||
+        timing->cea_vic != native_vic ||
         sizeof(default_edid_data) < MAX_EDID_SIZE)
         return -1;
 
-    /* Start from the board's original RK-UHD EDID. It advertises 4K50/60
-     * through a YCbCr 4:2:0 Video Data Block and limits the legacy HDMI VSDB
-     * to 340 MHz, which matches the receiver's known-good compatibility path.
+    /* Keep the board's original identification and HDMI capability blocks,
+     * but remove every base-block fallback timing. Some sources always select
+     * the first base DTD even when the requested CTA VIC is marked native.
+     * A single-mode EDID makes the requested UHD/DCI VIC unambiguous.
      */
     memcpy(edid, default_edid_data, MAX_EDID_SIZE);
-    extension = edid + PER_BLOCK;
+    edid[24] &= ~0x02; /* No preferred base-block timing. */
+    memset(edid + 35, 0, 3); /* No established timings. */
+    for (size_t i = 38; i < 54; ++i)
+        edid[i] = 0x01; /* No standard timings. */
+    memset(edid + 54, 0, 36); /* No base-block DTDs. */
 
-    if (extension[0] != 0x02 || extension[2] < 4 ||
-        extension[2] >= PER_BLOCK)
-        return -1;
+    /* EDID 1.x cannot encode a 4096-pixel active width. For 3840 modes, add
+     * a preferred DTD so sources that ignore low-refresh CTA VICs still select
+     * the requested mode. Keep the CTA total and pixel clock; only move an
+     * overlarge horizontal sync offset into the DTD's 10-bit range.
+     */
+    if (timing->hdisplay <= 4095) {
+        unsigned int hsync_offset;
 
-    position = 4;
-    while (position < extension[2]) {
-        unsigned int tag = extension[position] >> 5;
-        unsigned int length = extension[position] & 0x1f;
+        base_dtd = *timing;
+        hsync_offset = base_dtd.hsync_start - base_dtd.hdisplay;
+        if (hsync_offset > 1020) {
+            unsigned int adjustment = hsync_offset - 1020;
 
-        if (position + 1 + length > extension[2])
-            return -1;
-        if (tag == 2) {
-            for (unsigned int i = 0; i < length; ++i) {
-                unsigned char vic = extension[position + 1 + i] & 0x7f;
-
-                extension[position + 1 + i] = vic;
-                if (vic == native_vic) {
-                    extension[position + 1 + i] = 0x80 | vic;
-                    found_native_vic = 1;
-                }
-            }
+            base_dtd.hsync_start -= adjustment;
+            base_dtd.hsync_end -= adjustment;
         }
-        position += 1 + length;
+        if (write_detailed_timing(edid + 54, &base_dtd) < 0)
+            return -1;
+        edid[24] |= 0x02;
+    }
+    extension = edid + PER_BLOCK;
+    memset(extension, 0, PER_BLOCK);
+    extension[0] = 0x02;
+    extension[1] = 0x03;
+    extension[3] = 0xf0; /* Original color/audio flags, no native CTA DTD. */
+
+    extension[position++] = 0x41;
+    extension[position++] = 0x80 | native_vic;
+
+#define APPEND_NATIVE_BLOCK(data) do { \
+        memcpy(extension + position, (data), sizeof(data)); \
+        position += sizeof(data); \
+    } while (0)
+    APPEND_NATIVE_BLOCK(audio_block);
+    APPEND_NATIVE_BLOCK(speaker_block);
+    if (native_vic == 98) {
+        APPEND_NATIVE_BLOCK(hdmi_vsdb_dci24);
+    } else {
+        APPEND_NATIVE_BLOCK(hdmi_vsdb);
+    }
+    APPEND_NATIVE_BLOCK(colorimetry_block);
+#undef APPEND_NATIVE_BLOCK
+
+    if (native_vic == 96 || native_vic == 97 ||
+        native_vic == 101 || native_vic == 102) {
+        extension[position++] = 0xe2;
+        extension[position++] = 0x0e; /* YCbCr 4:2:0 Video Data Block */
+        extension[position++] = (unsigned char)native_vic;
     }
 
-    if (!found_native_vic)
-        return -1;
+    extension[2] = (unsigned char)position;
 
     edid[127] = calculate_block_checksum(edid);
     extension[127] = calculate_block_checksum(extension);
+    for (unsigned int block = 0; block < MAX_EDID_BLOCKS; ++block) {
+        unsigned int sum = 0;
+
+        for (size_t i = 0; i < PER_BLOCK; ++i)
+            sum += edid[block * PER_BLOCK + i];
+        if ((sum & 0xff) != 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -389,8 +477,7 @@ static int generate_cta_extension(unsigned char extension[PER_BLOCK],
         0x83, 0x01, 0x00, 0x00
     };
     static const unsigned char hdmi_vsdb[] = {
-        0x6d, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x00,
-        0x44, 0x20, 0x00, 0x60, 0x03, 0x02, 0x01
+        0x67, 0x03, 0x0c, 0x00, 0x30, 0x00, 0x00, 0x44
     };
     static const unsigned char hdmi_forum_vsdb[] = {
         0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0xc0, 0x00
@@ -401,6 +488,8 @@ static int generate_cta_extension(unsigned char extension[PER_BLOCK],
     static const unsigned char video_capability_block[] = {
         0xe2, 0x00, 0xcb
     };
+    unsigned char svds[3];
+    unsigned int svd_count = 0;
     size_t position = 4;
 
     if (!extension || native_vic > 127 || (native_vic && native_dtd))
@@ -412,20 +501,24 @@ static int generate_cta_extension(unsigned char extension[PER_BLOCK],
     extension[3] = 0xf0; /* Basic audio, YCbCr 4:4:4 and 4:2:2 */
 
     if (native_vic) {
-        extension[position++] = 0x44; /* Video Data Block, four SVDs */
-        extension[position++] = 0x80 | native_vic;
-        extension[position++] = 16;   /* 1920x1080p60 fallback */
-        extension[position++] = 4;    /* 1280x720p60 fallback */
-        extension[position++] = 1;    /* 640x480p60 fallback */
+        svds[svd_count++] = 0x80 | native_vic;
+        if (native_vic == 4 || native_vic == 19) {
+            svds[svd_count++] = 1;
+        } else if (native_vic != 1) {
+            svds[svd_count++] = 4;
+            svds[svd_count++] = 1;
+        }
     } else {
         /* Custom modes have no CTA VIC. Do not incorrectly mark VIC 16 as
          * native: the custom DTD below is the preferred/native timing.
          */
-        extension[position++] = 0x43; /* Video Data Block, three fallbacks */
-        extension[position++] = 16;
-        extension[position++] = 4;
-        extension[position++] = 1;
+        svds[svd_count++] = 16;
+        svds[svd_count++] = 4;
+        svds[svd_count++] = 1;
     }
+    extension[position++] = 0x40 | svd_count;
+    memcpy(extension + position, svds, svd_count);
+    position += svd_count;
 
 #define APPEND_CTA_BLOCK(data) do { \
         memcpy(extension + position, (data), sizeof(data)); \
@@ -463,9 +556,6 @@ static int generate_edid_array(unsigned int requested_width,
     static const unsigned char header[8] = {
         0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
     };
-    static const unsigned char chromaticity[10] = {
-        0x0a, 0xcf, 0x74, 0xa3, 0x57, 0x4c, 0xb0, 0x23, 0x09, 0x48
-    };
     struct video_timing timing;
     struct video_timing base_dtd_timing;
     char monitor_name[14];
@@ -485,8 +575,9 @@ static int generate_edid_array(unsigned int requested_width,
                                frame_rate, &timing) < 0)
         return -1;
 
-    if (timing.cea_vic >= 93 && timing.cea_vic <= 97) {
-        if (generate_native_compatible_4k_edid(timing.cea_vic, edid) < 0)
+    if (timing.cea_vic >= 93 && timing.cea_vic <= 102) {
+        if (generate_native_compatible_uhd_edid(timing.cea_vic, &timing,
+                                                edid) < 0)
             return -1;
         if (generated_timing)
             *generated_timing = timing;
@@ -501,19 +592,12 @@ static int generate_edid_array(unsigned int requested_width,
 
     memset(edid, 0, MAX_EDID_SIZE);
     memcpy(edid, header, sizeof(header));
-    edid[8] = 0x49;       /* Manufacturer: RKP */
-    edid[9] = 0x70;
-    edid[10] = 0x88;     /* Product code: 0x3588 */
-    edid[11] = 0x35;
-    edid[12] = 0x01;     /* Serial number */
-    edid[16] = 0x01;     /* Manufacture week */
-    edid[17] = 0x24;     /* Manufacture year: 2026 */
-    edid[18] = 0x01;     /* EDID 1.4 */
-    edid[19] = 0x04;
-    edid[20] = 0x80;     /* Digital input */
-    edid[23] = 0x78;     /* Gamma 2.2 */
-    edid[24] = 0x0a;     /* Preferred timing is in descriptor 1 */
-    memcpy(edid + 25, chromaticity, sizeof(chromaticity));
+    /* Keep the original RK-UHD identity, EDID revision, display parameters,
+     * and chromaticity even for non-UHD modes. On the tested HDMI source,
+     * synthetic values made otherwise valid 640x480 and QHD EDIDs fall back
+     * or fail to lock. Timing descriptors below remain mode-specific.
+     */
+    memcpy(edid + 8, default_edid_data + 8, 27);
     for (size_t i = 38; i < 54; ++i)
         edid[i] = 0x01;  /* Unused standard timing slots */
 
@@ -546,7 +630,7 @@ static int generate_edid_array(unsigned int requested_width,
     edid[99] = maximum_clock_10mhz < 255 ? maximum_clock_10mhz : 255;
 
     write_text_descriptor(edid + 108, 0xff,
-                          is_cea_timing ? "CTA-4K" : "AUTO-CVT-RB");
+                          is_cea_timing ? "CTA-MODE" : "AUTO-CVT-RB");
 
     if (needs_cta_extension) {
         const struct video_timing *cta_native_dtd =
@@ -784,6 +868,7 @@ int main(int argc, char *argv[])
         unsigned int requested_frame_rate;
         unsigned int actual_refresh_millihz;
         unsigned int generated_blocks;
+        const char *sync_polarity;
 
         if (parse_video_mode(generated_resolution, &requested_width,
                              &requested_height, &requested_frame_rate) < 0) {
@@ -797,7 +882,7 @@ int main(int argc, char *argv[])
                                 requested_frame_rate,
                                 generated_edid, &timing,
                                 &generated_blocks) < 0) {
-            fprintf(stderr, "无法为 %ux%u@%u 生成有效 EDID，可能超出 EDID 时钟范围\n",
+            fprintf(stderr, "无法为 %ux%u@%u 生成有效 EDID，可能超出当前链路或 EDID 时钟范围\n",
                     requested_width, requested_height, requested_frame_rate);
             return 1;
         }
@@ -805,6 +890,20 @@ int main(int argc, char *argv[])
         actual_refresh_millihz =
             (unsigned int)((uint64_t)timing.pixel_clock_khz * 1000000ULL /
                            ((uint64_t)timing.htotal * timing.vtotal));
+        switch (timing.dtd_flags & 0x06) {
+        case 0x06:
+            sync_polarity = "+hsync +vsync";
+            break;
+        case 0x04:
+            sync_polarity = "-hsync +vsync";
+            break;
+        case 0x02:
+            sync_polarity = "+hsync -vsync";
+            break;
+        default:
+            sync_polarity = "-hsync -vsync";
+            break;
+        }
         printf("生成 %s EDID: 请求 %ux%u@%u，实际 %ux%u @ %u.%03u fps\n",
                timing.cea_vic ? "CTA-861" : "CVT-RB",
                requested_width, requested_height, requested_frame_rate,
@@ -816,8 +915,7 @@ int main(int argc, char *argv[])
                timing.hdisplay, timing.hsync_start, timing.hsync_end,
                timing.htotal, timing.vdisplay, timing.vsync_start,
                timing.vsync_end, timing.vtotal,
-               timing.dtd_flags == 0x1e ? "+hsync +vsync" :
-                                           "+hsync -vsync");
+               sync_polarity);
         printf("EDID: %u block(s), %u bytes%s\n",
                generated_blocks, generated_blocks * PER_BLOCK,
                timing.cea_vic ? ", native CTA VIC present" : "");
