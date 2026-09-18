@@ -382,6 +382,10 @@ static int generate_native_compatible_uhd_edid(
     };
     unsigned char *extension;
     struct video_timing base_dtd;
+    uint64_t pixels_per_frame;
+    unsigned int vertical_hz;
+    unsigned int horizontal_khz;
+    unsigned int maximum_clock_10mhz;
     size_t position = 4;
 
     if (!edid || !timing || native_vic < 93 || native_vic > 102 ||
@@ -395,6 +399,31 @@ static int generate_native_compatible_uhd_edid(
      * A single-mode EDID makes the requested UHD/DCI VIC unambiguous.
      */
     memcpy(edid, default_edid_data, MAX_EDID_SIZE);
+    /* The fourth base descriptor is the template's range limits. Its
+     * original 59-70 Hz range conflicts with requested 24/25/30/50 Hz
+     * native VICs, so describe the timing actually advertised below.
+     * Reject a changed template rather than overwriting another descriptor.
+     */
+    if (edid[108] != 0 || edid[109] != 0 || edid[110] != 0 ||
+        edid[111] != 0xfd || edid[112] != 0 ||
+        !timing->htotal || !timing->vtotal || !timing->pixel_clock_khz)
+        return -1;
+    pixels_per_frame = (uint64_t)timing->htotal * timing->vtotal;
+    vertical_hz = (unsigned int)(
+        ((uint64_t)timing->pixel_clock_khz * 1000ULL +
+         pixels_per_frame / 2) / pixels_per_frame);
+    horizontal_khz = (timing->pixel_clock_khz + timing->htotal - 1) /
+                     timing->htotal;
+    maximum_clock_10mhz = (timing->pixel_clock_khz + 9999) / 10000;
+    if (!vertical_hz || !horizontal_khz ||
+        vertical_hz > 250 || horizontal_khz > 250 ||
+        maximum_clock_10mhz > 255)
+        return -1;
+    edid[113] = vertical_hz > 5 ? vertical_hz - 5 : 1;
+    edid[114] = vertical_hz + 5;
+    edid[115] = horizontal_khz > 5 ? horizontal_khz - 5 : 1;
+    edid[116] = horizontal_khz + 5;
+    edid[117] = maximum_clock_10mhz;
     edid[24] &= ~0x02; /* No preferred base-block timing. */
     memset(edid + 35, 0, 3); /* No established timings. */
     for (size_t i = 38; i < 54; ++i)
