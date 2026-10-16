@@ -41,6 +41,8 @@ struct edid_map edid_table[] = {
 #define HDMI_MAX_TMDS_CLOCK_KHZ 600000
 #define CVT_RB_V_FRONT_PORCH 3
 #define CVT_MIN_V_BACK_PORCH 6
+#define CTA_EXTENSION_TAG 0x02
+#define CTA_YCBCR_444_FLAG 0x20
 
 struct video_timing {
     unsigned int hdisplay;
@@ -82,11 +84,13 @@ static void print_usage(const char *program_name)
     printf("  -s <分辨率>     使用内置 EDID，例如 1920x1080_no_nv24\n");
     printf("  -r <宽x高@帧率> 自动生成 EDID 并设置 (默认 60 fps)\n");
     printf("  -n              仅打印由 -r 生成的 EDID，不设置设备\n");
+    printf("  -N, --no-nv24   不宣告 YCbCr 4:4:4，避免信号源选择 NV24\n");
     printf("  -p              打印设备当前 EDID\n");
     printf("  -m              设置默认 EDID\n");
     printf("  -h              显示此帮助信息\n");
     printf("\n示例:\n");
     printf("  %s -r 1920x1080@60              # 生成 1080p 60fps EDID\n", name);
+    printf("  %s -r 1920x1080@60 -N           # 生成不支持 NV24 的 EDID\n", name);
     printf("  %s -r 1920x1080@30 -n           # 仅生成 1080p 30fps 数组\n", name);
     printf("  %s -d /dev/video1 -r 1280x720@50 # 设置到指定设备\n", name);
     printf("  %s -s 1920x1080_no_nv24         # 使用已有 EDID\n", name);
@@ -358,6 +362,34 @@ static unsigned char calculate_block_checksum(const unsigned char *block)
     for (size_t i = 0; i < PER_BLOCK - 1; ++i)
         sum += block[i];
     return (unsigned char)(0x100 - (sum & 0xff));
+}
+
+/* NV24 is the V4L2 name for two-plane YCbCr 4:4:4. EDID does not carry
+ * Linux pixel-format names, so prevent a source from selecting NV24 by
+ * clearing the CTA-861 YCbCr 4:4:4 capability bit. Return the number of CTA
+ * extension blocks found; an EDID without a CTA extension already cannot
+ * advertise this capability.
+ */
+static int disable_nv24_advertisement(unsigned char *edid,
+                                      unsigned int blocks)
+{
+    unsigned int cta_blocks = 0;
+
+    if (!edid || !blocks)
+        return -1;
+
+    for (unsigned int block = 1; block < blocks; ++block) {
+        unsigned char *extension = edid + block * PER_BLOCK;
+
+        if (extension[0] != CTA_EXTENSION_TAG)
+            continue;
+
+        extension[3] &= (unsigned char)~CTA_YCBCR_444_FLAG;
+        extension[PER_BLOCK - 1] = calculate_block_checksum(extension);
+        ++cta_blocks;
+    }
+
+    return (int)cta_blocks;
 }
 
 static int generate_native_compatible_uhd_edid(
@@ -812,8 +844,57 @@ static int set_edid(const char *dev, unsigned char *edid_data, int blocks)
     return ret < 0 ? -1 : 0;
 }
 
+static int apply_no_nv24_option(unsigned char *edid_data,
+                                unsigned int blocks)
+{
+    int cta_blocks = disable_nv24_advertisement(edid_data, blocks);
+
+    if (cta_blocks < 0)
+        return -1;
+    if (cta_blocks == 0)
+        printf("NV24 已禁用: EDID 不含 CTA 扩展块，未宣告 YCbCr 4:4:4\n");
+    else
+        printf("NV24 已禁用: 已清除 %d 个 CTA 扩展块的 YCbCr 4:4:4 能力位\n",
+               cta_blocks);
+    return 0;
+}
+
+static int set_edid_with_options(const char *dev, unsigned char *edid_data,
+                                 int blocks, int no_nv24)
+{
+    unsigned char *modified_edid;
+    size_t edid_size;
+    int ret;
+
+    if (!no_nv24)
+        return set_edid(dev, edid_data, blocks);
+    if (!edid_data || blocks <= 0)
+        return -1;
+
+    edid_size = (size_t)blocks * PER_BLOCK;
+    modified_edid = malloc(edid_size);
+    if (!modified_edid) {
+        perror("allocate modified EDID failed");
+        return -1;
+    }
+
+    memcpy(modified_edid, edid_data, edid_size);
+    if (apply_no_nv24_option(modified_edid, (unsigned int)blocks) < 0) {
+        free(modified_edid);
+        return -1;
+    }
+
+    ret = set_edid(dev, modified_edid, blocks);
+    free(modified_edid);
+    return ret;
+}
+
 int main(int argc, char *argv[])
 {
+    static const struct option long_options[] = {
+        {"no-nv24", no_argument, NULL, 'N'},
+        {NULL, 0, NULL, 0}
+    };
     const char *dev = "/dev/video0";
     const char *edid_file = NULL;
     const char *edid_fmt = NULL;
@@ -821,9 +902,11 @@ int main(int argc, char *argv[])
     int print_edid = 0;
     int set_default_edid = 0;
     int dry_run = 0;
+    int no_nv24 = 0;
     int opt;
 
-    while ((opt = getopt(argc, argv, "d:f:s:r:phmn")) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:f:s:r:phmnN",
+                              long_options, NULL)) != -1) {
         switch (opt) {
         case 'd':
             dev = optarg;
@@ -846,6 +929,9 @@ int main(int argc, char *argv[])
         case 'n':
             dry_run = 1;
             break;
+        case 'N':
+            no_nv24 = 1;
+            break;
         case 'h':
             print_usage(argv[0]);
             return 0;
@@ -864,7 +950,8 @@ int main(int argc, char *argv[])
     }
 
     if (set_default_edid)
-        return set_edid(dev, default_edid_data, 2);
+        return set_edid_with_options(dev, default_edid_data, 2,
+                                     no_nv24) < 0 ? 1 : 0;
 
     if (edid_file) {
         unsigned char *edid_data;
@@ -884,7 +971,7 @@ int main(int argc, char *argv[])
 
         blocks = edid_size / PER_BLOCK;
         printf("set EDID data: %d block(s), %d bytes\n", blocks, edid_size);
-        ret = set_edid(dev, edid_data, blocks);
+        ret = set_edid_with_options(dev, edid_data, blocks, no_nv24);
         free(edid_data);
         return ret < 0 ? 1 : 0;
     }
@@ -913,6 +1000,12 @@ int main(int argc, char *argv[])
                                 &generated_blocks) < 0) {
             fprintf(stderr, "无法为 %ux%u@%u 生成有效 EDID，可能超出当前链路或 EDID 时钟范围\n",
                     requested_width, requested_height, requested_frame_rate);
+            return 1;
+        }
+
+        if (no_nv24 &&
+            apply_no_nv24_option(generated_edid, generated_blocks) < 0) {
+            fprintf(stderr, "无法从生成的 EDID 中禁用 NV24\n");
             return 1;
         }
 
@@ -960,8 +1053,9 @@ int main(int argc, char *argv[])
     if (edid_fmt) {
         for (size_t i = 0; i < sizeof(edid_table) / sizeof(edid_table[0]); ++i) {
             if (strcmp(edid_fmt, edid_table[i].fmt) == 0)
-                return set_edid(dev, edid_table[i].data_ptr,
-                                edid_table[i].blocks) < 0 ? 1 : 0;
+                return set_edid_with_options(dev, edid_table[i].data_ptr,
+                                             edid_table[i].blocks,
+                                             no_nv24) < 0 ? 1 : 0;
         }
         fprintf(stderr, "没有内置 EDID: %s\n", edid_fmt);
         return 1;
@@ -969,6 +1063,11 @@ int main(int argc, char *argv[])
 
     if (dry_run) {
         fprintf(stderr, "-n 必须与 -r WIDTHxHEIGHT 一起使用\n");
+        return 1;
+    }
+
+    if (no_nv24) {
+        fprintf(stderr, "-N/--no-nv24 必须与 -r、-s、-m 或 -f 一起使用\n");
         return 1;
     }
 
